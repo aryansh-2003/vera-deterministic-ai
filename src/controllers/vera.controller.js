@@ -11,7 +11,7 @@ const TEAM_METADATA = {
   team_members: ["Aryansh Dixit"],
   model: "llama-3.3-70b-versatile", 
   approach: "Deterministic JSON composition via Gemini Structured Outputs with full context injection",
-  contact_email: "your.email@example.com",
+  contact_email: "aryanshdixit24@gmail.com",
   version: "1.0.0",
   submitted_at: new Date().toISOString()
 };
@@ -41,6 +41,13 @@ const getMetadata = (req, res) => {
 
 const pushContext = async (req, res) => {
   const { scope, context_id, version, delivered_at, payload } = req.body;
+
+  if( !scope || !context_id || !version || !delivered_at || !payload ) {
+    return res.status(409).json({
+        accepted: false,
+        reason: "incomeplete_data",
+      });
+  }
 
   try {
     const existingContext = await Context.findOne({ context_id });
@@ -73,6 +80,13 @@ const pushContext = async (req, res) => {
 
 const handleTick = async (req, res) => {
   const { now, available_triggers } = req.body;
+
+  if( !now || !available_triggers ) {
+    return res.status(409).json({
+        accepted: false,
+        reason: "incomeplete_data",
+      });
+  }
   
   try {
     const activeTriggers = await Context.find({ context_id: { $in: available_triggers } });
@@ -168,6 +182,13 @@ const handleTick = async (req, res) => {
 
 const handleReply = async (req, res) => {
   const { conversation_id, merchant_id, customer_id, from_role, message, turn_number } = req.body;
+
+  if( !message || !turn_number ) {
+    return res.status(409).json({
+        accepted: false,
+        reason: "incomeplete_data",
+      });
+  }
 
   try {
     const merchantDoc = await Context.findOne({ context_id: merchant_id });
