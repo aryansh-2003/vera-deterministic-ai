@@ -1,10 +1,7 @@
-import {Context} from "../models/context.models.js"
+import { Context } from "../models/context.models.js"
 import Groq from "groq-sdk";
 
-
-
-const groq = new Groq({ apiKey: process.env.GROQ_API });
-
+const groq = new Groq({ apiKey: process.env.GROQ_API  });
 
 const TEAM_METADATA = {
   team_name: "JAD Studio", 
@@ -12,7 +9,7 @@ const TEAM_METADATA = {
   model: "llama-3.3-70b-versatile", 
   approach: "Deterministic JSON composition via Gemini Structured Outputs with full context injection",
   contact_email: "aryanshdixit24@gmail.com",
-  version: "1.0.0",
+  version: "1.0.1",
   submitted_at: new Date().toISOString()
 };
 
@@ -42,34 +39,42 @@ const getMetadata = (req, res) => {
 const pushContext = async (req, res) => {
   const { scope, context_id, version, delivered_at, payload } = req.body;
 
-  if( !scope || !context_id || !version || !delivered_at || !payload ) {
-    return res.status(409).json({
-        accepted: false,
-        reason: "incomeplete_data",
-      });
-  }
+
+  const reqVersion = Number(version);
 
   try {
     const existingContext = await Context.findOne({ context_id });
 
-    if (existingContext && existingContext.version >= version) {
-      return res.status(409).json({
-        accepted: false,
-        reason: "stale_version",
-        current_version: existingContext.version
-      });
+    if (existingContext) {
+      const existingVersion = Number(existingContext.version);
+
+      if (existingVersion > reqVersion) {
+        return res.status(409).json({
+          accepted: false,
+          reason: "stale_version",
+          current_version: existingVersion
+        });
+      }
+      
+      if (existingVersion === reqVersion) {
+        return res.status(200).json({
+          accepted: true,
+          ack_id: `ack_${context_id}_v${reqVersion}`,
+          stored_at: existingContext.delivered_at || new Date().toISOString() 
+        });
+      }
     }
 
-    await Context.findOneAndUpdate(
+    const updatedContext = await Context.findOneAndUpdate(
       { context_id },
-      { scope, version, delivered_at, payload },
+      { scope, version: reqVersion, delivered_at, payload },
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
 
     res.status(200).json({
       accepted: true,
-      ack_id: `ack_${context_id}_v${version}`,
-      stored_at: new Date().toISOString()
+      ack_id: `ack_${context_id}_v${reqVersion}`,
+      stored_at: updatedContext.delivered_at || new Date().toISOString()
     });
 
   } catch (error) {
@@ -78,25 +83,21 @@ const pushContext = async (req, res) => {
   }
 };
 
+
 const handleTick = async (req, res) => {
   const { now, available_triggers } = req.body;
 
-  if( !now || !available_triggers ) {
-    return res.status(409).json({
-        accepted: false,
-        reason: "incomeplete_data",
-      });
-  }
   
   try {
     const activeTriggers = await Context.find({ context_id: { $in: available_triggers } });
     const actions = [];
     
-    const triggerPromises = activeTriggers.map(async (triggerDoc) => {
+    for (const triggerDoc of activeTriggers) {
       try {
         const trigger = triggerDoc.payload;
+        
         const merchantDoc = await Context.findOne({ context_id: trigger.merchant_id });
-        if (!merchantDoc) return null;
+        if (!merchantDoc) continue; 
 
         const categoryDoc = await Context.findOne({ context_id: merchantDoc.payload.category_slug });
         
@@ -106,51 +107,71 @@ const handleTick = async (req, res) => {
           customerData = customerDoc ? customerDoc.payload : null;
         }
 
+       const categoryData = categoryDoc ? categoryDoc.payload : {};
+        const categoryOffers = categoryData.offer_catalog || [];
+        const categoryVoice = categoryData.voice || {};
+
+        if (trigger.customer_id) {
+          const customerDoc = await Context.findOne({ context_id: trigger.customer_id });
+          customerData = customerDoc ? customerDoc.payload : null;
+        }
+
+        const merchantName = merchantDoc.payload.identity?.name || merchantDoc.payload.name || "Business Partner";
+
         const prompt = `
-        You are Vera, an elite AI assistant for merchant growth on the magicpin platform. 
-        Goal: Evaluate context and compose a highly compelling, specific, actionable message.
+        You are Vera, an elite AI assistant for magicpin.
 
-        === CONTEXT ===
-        Time: ${now}
-        Trigger Kind: ${trigger.kind}
-        Trigger Data: ${JSON.stringify(trigger.payload)}
-        Merchant Name: ${merchantDoc.payload.name}
-        Category: ${categoryDoc ? categoryDoc.payload.name : "Local Business"}
-        Customer: ${customerData ? customerData.name : "None"}
+        === ENVIRONMENT REALITY DATA ===
+        Contextual Time: ${now}
+        Merchant Name: ${merchantName}
+        Customer Data: ${customerData ? JSON.stringify(customerData) : "N/A"}
+        Category Offers (Use these if drafting for a customer!): ${JSON.stringify(categoryOffers)}
+        Incoming Event Code: ${trigger.kind}
+        Event Deep-Payload Requirements: ${JSON.stringify(trigger.payload)}
 
-        === COMPOSITION DIRECTIVES ===
-        1. SPECIFICITY: Use exact numbers, dates, and names from the Trigger Data. No hallucinating.
-        2. TONE: Professional, strict operator-to-operator.
-        3. VALUE: Interpret the trigger (e.g., frame seasonal dips as normal, push alternatives).
-        4. CTA: Only ONE low-friction Call-to-Action (e.g., "Reply YES" or "Reply 1 or 2").
+        === FIRM INSTRUCTIVE BOUNDS & EXPECTED RESULT (DO NOT VIOLATE) ===
+        1. DETERMINE YOUR AUDIENCE & PERSONA:
+           - IF 'Customer Data' is present (e.g., recall_due): You are drafting a text TO THE CUSTOMER on behalf of the clinic. 
+             * Language: STRICTLY ENGLISH ONLY. Do NOT use Hindi, Hinglish, or any Hi-En mix.
+             * Greeting: You MUST start the message introducing the clinic: "Hi [Customer First Name], ${merchantName} here". (e.g., "Hi Priya, Dr. Meera's Dental Clinic here 🦷").
+             * Promos: Look at the 'Category Offers'. You MUST include the exact promo details in natural English (e.g., "We are offering a ₹299 cleaning + complimentary fluoride").
+             * Tone: Casual and friendly. Use emojis.
+             
+           - IF 'Customer Data' is N/A (e.g., perf_dip): You are texting the MERCHANT directly as a peer-operator.
+             * Greeting: Initiate directly ("${merchantName}, noticed an issue..."). NO "Dear".
+             * Rule: Calculate decimal drops mathematically (e.g., delta_pct="-0.50" becomes "50% drop").
 
-        === OUTPUT REQUIREMENTS ===
-        Return ONLY a valid JSON object. 
-        If irrelevant: { "should_send": false }
-        
-        If sending, use exactly this structure:
+        2. DATE FORMATTING: 
+           - Convert raw ISO dates to natural text (e.g., "Wed 5 Nov, 6pm"). Bold the slots using markdown (**Wed 5 Nov, 6pm**).
+
+        3. CALL TO ACTION (CTA):
+           - Customer booking: Ask them to pick a slot (e.g., "Reply 1 for Wed, 2 for Thu").
+
+        === PRECISE ACTION MAP COMPLETION ===
+        Form strict JSON exactly matching this schema. Note how 'send_as' and 'cta' change dynamically based on the audience!
         {
           "should_send": true,
           "action": {
             "conversation_id": "conv_gen_v1",
             "merchant_id": "${trigger.merchant_id}",
             "customer_id": ${trigger.customer_id ? `"${trigger.customer_id}"` : "null"},
-            "send_as": "vera", 
-            "trigger_id": "${trigger.id}",
-            "template_name": "direct_outreach",
+            "send_as": "${trigger.customer_id ? 'merchant_on_behalf' : 'vera'}", 
+            "trigger_id": "${trigger.id || trigger.context_id || 'base'}",
+            "template_name": "${trigger.customer_id ? 'merchant_recall_reminder_v1' : 'direct_outreach'}",
             "template_params": ["Param 1"],
-            "body": "Write the specific, compelling message here.",
-            "cta": "binary_yes_no",
+            "body": "<Enter Final Message Here - adhering strictly to ENGLISH ONLY and the audience rules above>",
+            "cta": "${trigger.customer_id ? 'multi_choice_slot' : 'multi_choice'}",
             "suppression_key": "${trigger.suppression_key || 'suppress_key'}",
-            "rationale": "Explain exactly why you chose this message."
+            "rationale": "<Explain exactly why you chose this tone and structure>"
           }
         }
+        Return JSON validation standard structure specifically parsing above without empty code injections. If Irrelevant -> { "should_send": false } 
         `;
 
         const chatCompletion = await groq.chat.completions.create({
           messages: [{ role: "system", content: prompt }],
-          model: "llama-3.1-8b-instant",
-          temperature: 0,
+          model: "llama-3.3-70b-versatile", 
+          temperature: 0.1, 
           response_format: { type: "json_object" }
         });
 
@@ -159,76 +180,67 @@ const handleTick = async (req, res) => {
         if (result.should_send && result.action) {
           result.action.customer_id = trigger.customer_id || null;
           result.action.merchant_id = trigger.merchant_id;
-          result.action.trigger_id = trigger.id;
-          return result.action;
+          result.action.trigger_id = trigger.id || trigger.context_id || "null_identifier";
+          actions.push(result.action);
         }
-        return null;
       } catch (innerError) {
-        console.error(`Groq Error:`, innerError.message);
-        return null;
+        console.error(`LLM Loop Block Fallthrough Execution Parsing Fail! Skip Processing -> `, innerError.message);
       }
-    });
-
-    
-    const results = await Promise.all(triggerPromises);
-    results.forEach(action => { if (action) actions.push(action); });
+    }
 
     res.status(200).json({ actions });
   } catch (error) {
-    console.error("Tick Outer Error:", error.message);
+    console.error("Outer Event Push Controller Panic Error:", error.message);
     res.status(500).json({ actions: [] }); 
   }
 };
 
+
 const handleReply = async (req, res) => {
   const { conversation_id, merchant_id, customer_id, from_role, message, turn_number } = req.body;
 
-  if( !message || !turn_number ) {
-    return res.status(409).json({
-        accepted: false,
-        reason: "incomeplete_data",
-      });
-  }
 
   try {
     const merchantDoc = await Context.findOne({ context_id: merchant_id });
-    const merchantData = merchantDoc ? merchantDoc.payload : {};
+    const merchantName = merchantDoc ? (merchantDoc.payload.identity?.name || merchantDoc.payload.name || "Business") : "Business";
+    
+    let customerName = "User";
+    if (customer_id) {
+      const customerDoc = await Context.findOne({ context_id: customer_id });
+      customerName = customerDoc ? (customerDoc.payload.name || "Customer") : "Customer";
+    }
 
-   const prompt = `
-      You are Vera, evaluating a reply from a merchant.
-      
-      Analyze the merchant's message and decide the exact next action.
-      
-      Rules for classification:
-      1. Auto-reply detected (e.g., "Thank you for contacting..."): 
-         - If turn_number is 1 or 2, Action = "wait", wait_seconds = 14400.
-         - If turn_number is 3, Action = "wait", wait_seconds = 86400.
-         - If turn_number is 4 or higher, Action = "end".
-      2. Hostile/Opt-out ("stop", "useless", "don't bother"): Action = "end".
-      3. Intent transition ("let's do it", "yes send it"): Action = "send". Provide concrete next steps (e.g., "Drafting the WhatsApp now"). DO NOT ask qualifying questions. Provide a strict binary commit (e.g., "Reply CONFIRM to send").
-      4. Off-topic: Politely redirect to the main objective. Action = "send".
-      
-      Current Turn: ${turn_number}
-      Merchant ID: ${merchant_id}
-      Incoming Message: "${message}"
-      Merchant Context: ${JSON.stringify(merchantData)}
+    const prompt = `
+      You are Vera evaluating response incoming WhatsApp text inputs actively matching system execution mappings appropriately based directly onto strict parameters layout below. 
 
-      === OUTPUT REQUIREMENTS ===
-      You MUST output ONLY a valid JSON object matching this EXACT structure.
-      Do not include any outside text.
+      === REPLY INPUT FRAME VARIABLES ===
+      Live Depth Process Run: ${turn_number} 
+      Trigger Role Owner Data : ${from_role || "user"}
+      Current Interacted Base Entity User -> ${merchantName}
+      Reachable Outgoing Contact Name Profile Base Entity User (Crucial Specific Entity Name Mention Requires Attention Extracted!!!) -> ${customerName}
+      Provided Chat Entry Input Data Code (MEMBER ACTUAL SENT INPUTS): "${message}"
 
+      === DECISION RULES & OUTCOME EXPLANATION (PRIORITIZED FLOW FORMATTING EXACT MATCHES) === 
+      Rule One: 'Strict HOSTILE / OPT-OUT': Is user overtly stating generic hostile flags "Don't send anymore text!", "stop that text logic!" -> Outcome format required strictly equals! { action: "end" } DO NOT DRAFT text!
+      Rule Two: "Bot Machine Out of Office Return Catchments Data Blocks" - > Action Output Must Format Equivalently equals = {action: "wait"} . Based entirely per index Turn_number values natively [ turn == 1 | 2 (equals parameter inject property explicit "wait_seconds" mapped 14400!). Turns explicit matching equal == 3 values logic (Wait mappings -> 86400)... Greater parameters end. ]
+      Rule Three: Handling Complex Extrapolated Value Over Intent Question Requestings... Examples inputs requesting off paths "So gst totals logic totals? Who made this platform bots system code..."! YOU WILL NEVER immediately exit without context answerings!!! Action Map required returns "send". Immediately begin output payload response Text Answering Query warmly smoothly! Reestablish priority request values next phrase softly after!! No Questions left out without closures!
+      Rule Four (Normal Approvals Paths Intents): End logic outputs exactly explicitly enforcing binary locks! E.G., action output parameter requires format ("send") with payload parameters concluding precisely forcing logic lock binary confirmation values (ex, "Perfect Priya I drafted details. Simply enter CONFIRM below to forward system texts layout setup process formats mappings.")!! Ensure Body explicitly naturally confirms Customer variables!
+
+      Output ONLY properly formatting nested json formats! Keep texts short and casually referenced directly at them (Exclusively Reference using actual Names formats -> (E.G. Addressing directly Customer text mappings REQUIRES literal usage reference to specific User Context mappings e.g -> '${customerName}' directly mapped!!! Don't ignore inserting users first names organically! Never formally begin texts Dear).
+
+      EXPECTING OUTPUT COMPOSITE BATCH FOR MAP EVAL FORMAT! :
       {
-        "action": "send", // MUST be one of: "send", "wait", or "end"
-        "body": "Write the reply message here (Only include if action is 'send')",
-        "cta": "Write the call to action here (Only include if action is 'send')",
-        "wait_seconds": 14400, // (Only include if action is 'wait')
-        "rationale": "Explain exactly why you chose this action based on the rules."
+        "action": "send", 
+        "body": "Construct 1 sentence friendly, concise answer. Reply natively text formatting formats mapped correctly references explicitly ${customerName}",
+        "cta": "Include mapped exact binaries formats...",
+        "wait_seconds": 14400, 
+        "rationale": "Exact execution logics format!"
       }
     `;
 
     const chatCompletion = await groq.chat.completions.create({
       messages: [{ role: "system", content: prompt }],
-      model: "llama-3.3-70b-versatile",
+      model: "llama-3.3-70b-versatile", // Maintain accuracy & complex inference over rules using upgraded Versatile context handling over the smaller instant bounds  
       temperature: 0,
       response_format: { type: "json_object" }, 
     });
@@ -245,11 +257,10 @@ const handleReply = async (req, res) => {
 
     res.status(200).json(result);
   } catch (error) {
-    console.error("Reply Error:", error.message);
-
+    console.error("Reply Execution Flow Handled Fatal Context Extrusion!", error.message);
     res.status(500).json({ 
       action: "end", 
-      rationale: "Internal server error during reply processing; closing thread safely." 
+      rationale: "Execution Fall-through Handled Logic Errors System Bounds. " 
     });
   }
 };
@@ -260,4 +271,4 @@ export {
     getMetadata,
     handleTick,
     handleReply
-}
+};
